@@ -1,0 +1,592 @@
+##########Feature Selection##########################
+#GSVA
+library(tidyverse)
+library(clusterProfiler)
+library(msigdbr)  #install.packages("msigdbr")
+library(GSVA) 
+library(GSEABase)
+library(pheatmap)
+library(limma)
+library(BiocParallel)
+library(tidyverse)  
+library(ggthemes)
+library(ggprism)
+KEGG_df_all <-  msigdbr(species = "Homo sapiens", # Homo sapiens or Mus musculus
+                        category = "C2",
+                        subcategory = "CP:KEGG") 
+KEGG_df <- dplyr::select(KEGG_df_all,gs_name,gs_exact_source,gene_symbol)
+kegg_list <- split(KEGG_df$gene_symbol, KEGG_df$gs_name) ##按照gs_name给gene_symbol分组
+gsva_mat <- gsva(expr=dat, 
+                 gset.idx.list=geneset, 
+                 kcdf="Poisson" ,#"Gaussian" for logCPM,logRPKM,logTPM, "Poisson" for counts
+                 verbose=T, 
+                 parallel.sz = parallel::detectCores())#调用所有核
+
+group_list<-factor(c(rep("pCR",57), rep("RD",113)), levels = c('pCR', 'RD'))
+design <- model.matrix(~0+factor(group_list))
+colnames(design) <- levels(factor(group_list))
+rownames(design) <- rownames(rep)
+compare <- makeContrasts(pCR - RD, levels=design)
+fit1 <- lmFit(gsva_mat,design)                
+fit2 <- contrasts.fit(fit1, compare) 
+efit <- eBayes(fit2)                         
+Diff <- topTable(efit, coef=1, number=200)
+p_cutoff=0.05
+degs <- Diff  
+Diff <- rbind(subset(degs,logFC>0)[1:10,], subset(degs,logFC<0)[1:10,])   
+dat_plot <- data.frame(id  = row.names(Diff),
+                       p   = Diff$adj.P.Val,
+                       lgfc= Diff$logFC)
+dat_plot$group <- ifelse(dat_plot$lgfc>0 ,1,-1) 
+dat_plot$lg_p <- -log10(dat_plot$p)*dat_plot$group
+dat_plot$id <- str_replace(dat_plot$id, "kegg_","");dat_plot$id[1:10]
+dat_plot$threshold <- factor(ifelse(abs(dat_plot$p) <= p_cutoff,
+                                    ifelse(dat_plot$lgfc >0 ,'Up','Down'),'Not'),
+                             levels=c('Up','Down','Not'))
+dat_plot <- dat_plot %>% arrange(lg_p)
+dat_plot$id <- factor(dat_plot$id,levels = dat_plot$id)
+low1 <- dat_plot %>% filter(lg_p < log10(p_cutoff)) %>% nrow()
+low0 <- dat_plot %>% filter(lg_p < 0) %>% nrow()
+high0 <- dat_plot %>% filter(lg_p < -log10(p_cutoff)) %>% nrow()
+high1 <- nrow(dat_plot)
+
+p <- ggplot(data = dat_plot,aes(x = id, y = lg_p, 
+                                fill = threshold)) +
+  geom_col()+
+  coord_flip() + 
+  scale_fill_manual(values = c('Up'= '#36638a','Not'='#cccccc','Down'='#7bcd7b')) +
+  geom_hline(yintercept = c(-log10(p_cutoff),log10(p_cutoff)),color = 'white',size = 0.5,lty='dashed') +
+  xlab('') + 
+  ylab('-log10(P.Value) of GSVA score') + 
+  guides(fill="none")+
+  theme_prism(border = T) +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  ) +
+  geom_text(data = dat_plot[1:low1,],aes(x = id,y = 0.1,label = id),
+            hjust = 0,color = 'black') +
+  geom_text(data = dat_plot[(low1 +1):low0,],aes(x = id,y = 0.1,label = id),
+            hjust = 0,color = 'grey') + 
+  geom_text(data = dat_plot[(low0 + 1):high0,],aes(x = id,y = -0.1,label = id),
+            hjust = 1,color = 'grey') + 
+  geom_text(data = dat_plot[(high0 +1):high1,],aes(x = id,y = -0.1,label = id),
+            hjust = 1,color = 'black') 
+
+#Boruta
+library(ImageGP)
+library(Boruta)
+set.seed(2023)
+x<-dat[,2:833]
+y<-as.factor(dat[,1])
+boruta <- Boruta(x, y, pValue=0.05, mcAdj=T, maxRuns=1000)
+library(dplyr)
+boruta.imp <- function(x){
+  imp <- reshape2::melt(x$ImpHistory, na.rm=T)[,-1]
+  colnames(imp) <- c("Variable","Importance")
+  imp <- imp[is.finite(imp$Importance),]
+  variableGrp <- data.frame(Variable=names(x$finalDecision), 
+                            finalDecision=x$finalDecision)
+  showGrp <- data.frame(Variable=c("shadowMax", "shadowMean", "shadowMin"),
+                        finalDecision=c("shadowMax", "shadowMean", "shadowMin"))
+  variableGrp <- rbind(variableGrp, showGrp)
+  boruta.variable.imp <- merge(imp, variableGrp, all.x=T)
+  sortedVariable <- boruta.variable.imp %>% group_by(Variable) %>% 
+    summarise(median=median(Importance)) %>% arrange(median)
+  sortedVariable <- as.vector(sortedVariable$Variable)
+  boruta.variable.imp$Variable <- factor(boruta.variable.imp$Variable, levels=sortedVariable)
+  invisible(boruta.variable.imp)
+}
+boruta.variable.imp <- boruta.imp(boruta)
+head(boruta.variable.imp)
+sp_boxplot(boruta.variable.imp, melted = TRUE, xvariable = "Variable", yvariable = "Importance",
+           legend_variable = "finalDecision", legend_variable_order = c("shadowMax", "shadowMean", "shadowMin", "Confirmed"),
+           xtics_angle = 90)
+
+#SVM-RFE
+library(caret)
+library(fmsb)
+library(cols4all)
+library(ggradar)
+gene_data$Respond <- as.factor(gene_data$Respond)
+control <- rfeControl(functions = caretFuncs, method = "cv", number = 5, verbose = FALSE)
+bootstrap_function <- function(data, indices) {
+  bootstrap_sample <- data[indices, ]
+  set.seed(2023)
+  result <- rfe(x = bootstrap_sample[, 2:14], y = bootstrap_sample[, 1], sizes = c(1:13), rfeControl = control, method = "svmRadial")
+  gene_selection <- colnames(bootstrap_sample[-1]) %in% result$optVariables
+  return(gene_selection)
+}
+set.seed(2023)
+results <- boot(data = gene_data, statistic = bootstrap_function, R =1000, 
+                parallel = "multicore", 
+                ncpus =12)
+gene_frequency <- rep(0, ncol(gene_data[-1]))
+names(gene_frequency) <- colnames(gene_data[-1])
+for (i in 1:nrow(results$t)) {
+  selected_genes <- names(results$t[i, ])[results$t[i, ]]
+  gene_frequency[selected_genes] <- gene_frequency[selected_genes] + 1
+}
+gene_frequency <- colSums(results$t)
+gene_frequency_df <- as.data.frame(gene_frequency)
+rownames(gene_frequency_df) <- colnames(gene_data[-1])
+colnames(gene_frequency_df) <- c("Frequency")
+feature_selection_results <- as.data.frame(results$t)
+colnames(feature_selection_results) <- colnames(gene_data[-1])
+feature_frequency <- colSums(feature_selection_results)
+feature_frequency_normalized <- feature_frequency /1000
+df_radar <- as.data.frame(list(Feature = names(feature_frequency), Frequency = feature_frequency_normalized))
+df_radar <-data.frame(t(df_radar[-1]))
+df_radar$Feature <- rownames(df_radar)
+df_radar <- df_radar[, c(ncol(df_radar), 1:(ncol(df_radar)-1))]
+ggradar(df_radar,
+        grid.min = 0, 
+        grid.mid = 0.8, 
+        grid.max = 1, 
+        values.radar = c(0,0.8,1), 
+        group.colours ="#4979b6",
+        group.point.size =2,
+        group.line.width = 1, 
+        background.circle.colour = 'grey', 
+        background.circle.transparency = 0,
+        fill = TRUE, 
+        fill.alpha = 0.3,
+        gridline.mid.colour = "#d9352a",
+        axis.label.size =5
+)
+
+##########Model Development##########################
+library(glmnet)
+library(randomForest)
+library(xgboost)
+library(ridge)
+library(caret)
+library(pROC)
+library(caret)
+library(caretEnsemble)
+library(magrittr)
+library(caTools)
+library(dplyr)
+#control
+cls.ctrl <- trainControl(method = "repeatedcv",
+                         number = 10,
+                         repeats = 5,
+                         classProbs = TRUE,
+                         summaryFunction = twoClassSummary,
+                         savePredictions = "final",
+                         allowParallel = TRUE)
+#createDataPartition
+set.seed(2023)
+trainIndices <- lapply(1:5, function(i) createDataPartition(data$Respond, p = 0.7, list = FALSE))
+trainDataList <- lapply(trainIndices, function(index) data[index, ])
+
+#NNET
+set.seed(2023)
+trainData1<- trainDataList[[1]]
+trainData1$Respond <- as.factor(trainData1$Respond)
+nnet_params <- expand.grid(size=c(1,2,3,4,5),decay=c(0.001,0.01,0.1))
+nnet<- caretList(Respond ~ ., 
+                 data = trainData1, 
+                 trControl = cls.ctrl, 
+                 metric = "ROC",
+                 tuneList = list(nnet = caretModelSpec(method = "nnet")), 
+                 preProcess = c("nzv", "center", "scale"),
+                 tuneGrid =nnet_params)
+
+#RF
+set.seed(2023)
+trainData2<- trainDataList[[2]]
+trainData2$Respond <- as.factor(trainData2$Respond)
+rf_params <- expand.grid(mtry=c(3,4,5,6),splitrule="gini",min.node.size=c(1,5,10,15,20))
+rf<- caretList(Respond ~ ., 
+               data = trainData2, 
+               trControl = cls.ctrl, 
+               metric = "ROC",
+               tuneList = list(rf= caretModelSpec(method = "ranger")), 
+               preProcess = c("nzv", "center", "scale"),
+               tuneGrid =rf_params)
+
+#XGB
+set.seed(2023)
+trainData3<- trainDataList[[3]]
+trainData3$Respond <- as.factor(trainData3$Respond)
+xgb_params <- expand.grid(nrounds=c(100,200),
+                          max_depth=c(4, 6),
+                          eta=c(0.01, 0.05, 0.1),
+                          gamma=0,
+                          colsample_bytree=c(0.6, 0.8),
+                          min_child_weight=c(2,4,6),
+                          subsample=c(0.6, 0.8))
+xgb<- caretList(Respond ~ ., 
+                data = trainData3, 
+                trControl = cls.ctrl, 
+                metric = "ROC",
+                tuneList = list(xgb=caretModelSpec(method = "xgbTree")), 
+                preProcess = c("nzv", "center", "scale"),
+                tuneGrid=xgb_params)
+
+#BN
+set.seed(2023)
+trainData4<- trainDataList[[4]]
+trainData4$Respond <- as.factor(trainData4$Respond)
+bn<- caretList(Respond ~ ., 
+               data = trainData4, 
+               trControl = cls.ctrl, 
+               metric = "ROC",
+               tuneList = list(bn=caretModelSpec(method = "naive_bayes")), 
+               preProcess = c("nzv", "center", "scale"))
+
+#GBM
+set.seed(2023)
+trainData5<- trainDataList[[5]]
+trainData5$Respond <- as.factor(trainData5$Respond)
+gbm_params <- expand.grid(n.trees=c(100,150,200),
+                          interaction.depth=c(2,4,6,8),
+                          shrinkage=c(0.01, 0.1),
+                          n.minobsinnode=c(4,6,8))
+gbm<- caretList(Respond ~ ., 
+                data = trainData5, 
+                trControl = cls.ctrl, 
+                metric = "ROC",
+                tuneList = list(gbm=caretModelSpec(method = "gbm")), 
+                preProcess = c("nzv", "center", "scale"),
+                tuneGrid=gbm_params)
+combind<-c(nnet,rf,xgb,bn,gbm)
+cor<-modelCor(resamples(combind))
+#Ensemble model
+set.seed(2023)
+ensemble<- caretStack(combind, method = "glm", metric = "ROC", trControl = cls.ctrl)
+
+##########Model Evaluation##########################
+#ROC
+library(caret)
+library(pROC)
+library(caret)
+prednnet<-predict(nnet$nnet, newdata = data, type = "prob")[, 1]
+predrf<-predict(rf$rf, newdata = data, type = "prob")[, 1]
+predxgb<-predict(xgb$xgb, newdata = data, type = "prob")[, 1]
+predbn<-predict(bn$bn, newdata = data, type = "prob")[, 1]
+predgbm<-predict(gbm$gbm, newdata = data, type = "prob")[, 1]
+predens<-predict(ensemble, newdata = data, type = "prob")
+pred<-cbind(Respond=data[1],NNET=prednnet,RF=predrf,XGB=predxgb,BN=predbn,GBM=predgbm,ENS=predens)
+roc.list <- roc(Respond ~ .,
+                data = pred,
+                legacy.axes=T,
+                smooth=T,
+                plot=T,
+                auc=T)
+auc1 <- round(auc(roc.list[[1]]),3)
+auc2 <- round(auc(roc.list[[2]]),3)
+auc3 <- round(auc(roc.list[[3]]),3)
+auc4 <- round(auc(roc.list[[4]]),3)
+auc5 <- round(auc(roc.list[[5]]),3)
+auc6 <- round(auc(roc.list[[6]]),3)
+lab <- paste0("NNET = ",auc1,"\n","RF = ",auc2,"\n","XGB = ",auc3,"\n"
+              ,"BN = ",auc4,"\n","GBM = ",auc5,"\n","ENS = ",auc6,"\n")
+p <- ggroc(roc.list,legacy.axes=T,size=0.3)+
+          geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey")+ 
+          scale_colour_manual(values = c4a('vivid',12))+
+          theme_classic()+
+           annotate("text",x = 0.85,y = 0.2,
+           label =lab,
+           size = 4)+labs(color = "Models")+
+           labs(color = "") +
+           ggtitle("Training set")+
+           theme(axis.title.x = element_text(size = 12),
+          axis.title.y = element_text(size = 12),
+          axis.text.x = element_text(size = 10),
+          axis.text.y = element_text(size = 10,
+           plot.title = element_text(size = 14,  hjust = 0.5),
+           legend.position = "top", 
+           legend.direction = "horizontal",
+           legend.title = element_text(size = 1),
+           legend.text = element_text(size = 10))+
+           guides(color = guide_legend(nrow = 1)) 
+
+#PRAUC
+predens_train <- predict(ensemble, newdata = data, type = "prob")
+data$Respond <- ifelse(data$Respond == "pCR", 1, 0)
+aupr_train <- AUC(obs = data$Respond, pred = predens_train, curve = "PR")
+df_train <- as.data.frame(aupr_train$thresholds)
+df_train$Dataset <- "Training"
+predens_test <- predict(xgb_ensemble, newdata = dat1, type = "prob")
+dat1$Respond <- ifelse(dat1$Respond == "pCR", 1, 0)
+aupr_test <- AUC(obs = dat1$Respond, pred = predens_test, curve = "PR")
+df_test <- as.data.frame(aupr_test$thresholds)
+df_test$Dataset <- "Test"
+df_combined <- rbind(df_train, df_test)
+ggplot(df_combined, aes(x = sensitivity, y = precision, color = Dataset)) +
+  geom_line() +
+  geom_segment(aes(x = 1, y = 0, xend = 0, yend = 1), linetype = "dashed", color = "#A5AA99") +
+  annotate("text", x = 0.02, y = 0.1, 
+           label = paste("Training PRAUC = ", round(aupr_train$AUC, 3)), 
+           color = "#2F8AC4", size = 4, hjust = 0) +
+  annotate("text", x = 0.02, y = 0.01, 
+           label = paste("Test PRAUC = ", round(aupr_test$AUC, 3)), 
+           color = "#E41A1C", size = 4, hjust = 0) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(x = "Recall", y = "Precision") +
+  theme_bw() +
+  theme(
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    legend.title = element_text(),
+    legend.text = element_text(size = 10),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "top",  
+    legend.box = "horizontal"  
+  ) +
+  guides(colour = guide_legend(title = NULL))+
+  scale_color_manual(values = c("Training" = "#2F8AC4", "Test" = "#E41A1C"))
+
+#DCA
+library(rms)
+library(ggDCA)
+library(survival)
+library(reshape2)
+library(ggplot2)
+library(stringr)
+predict<-as.data.frame(predict(ensemble, newdata = data, type = "prob"))
+colnames(predict)<-"Pred"
+rownames(predict)<-rownames(data)
+dac<-cbind(data[1],predict)
+dac$Respond<-ifelse(str_sub(dac$Respond,1,1)=='p',1,0)
+dca(data=dac, outcome="Respond", predictors="Pred",smooth="TRUE",probability="TRUE")
+net.benefit<-as.data.frame(dca(data=dac, outcome="Respond", predictors="Pred",smooth="TRUE",probability="TRUE"))
+dca_melt <- melt(net.benefit, id.vars = 'net.benefit.threshold', 
+                 measure.vars = c('net.benefit.none', 'net.benefit.all', 'net.benefit.Pred'), 
+                 variable.name = 'Group', value.name = 'Net Benefit')
+ggplot(dca_melt, aes(x = net.benefit.threshold, y = `Net Benefit`, color = Group)) +
+  geom_line() +
+  labs(x = "Threshold", y = "Net Benefit") +
+  theme_bw() +
+  ggtitle("Training set")+
+  theme(text = element_text(size=12), 
+        legend.position = c(0.8, 0.8),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),  # Position the legend inside the plot
+        legend.title = element_blank(),
+        legend.text = element_text(size = 10),   # Remove the legend title
+        panel.grid.major = element_blank(),  # Remove major grid
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(size = 14,  hjust = 0.5)) +  # Remove minor grid
+  ylim(-0.1, 0.35)+  # Here is where we set the y axis limits
+  scale_color_discrete(labels = c("None", "All", "Pred"))
+
+#Calibration Curve
+library(caret)
+library(rms)
+library(pROC)
+library(ggplot2)
+library(rmda)
+library(DescTools)
+library(dplyr)
+prediction<-predict(xgb_ensemble, newdata = data,type = "prob")
+cal_data <- data.frame( predicted = prediction,observed = ifelse(data$Respond == "pCR", 1, 0)  )
+cal_data$bin <- cut(cal_data$predicted, breaks = seq(0, 1, by = 0.25))
+cal_summary_train<- cal_data %>%
+  group_by(bin) %>%
+  summarise(
+    mean_predicted = mean(predicted),
+    mean_observed = mean(observed),
+    se_predicted = sd(predicted) / sqrt(n()),
+    se_observed = sd(observed) / sqrt(n())
+  )
+trainingbrier<-BrierScore(cal_data$predicted, cal_data$observed)
+prediction<-predict(ensemble, newdata = dat1,type = "prob")
+cal_data <- data.frame(predicted = prediction,observed = ifelse(dat1$Respond == "pCR", 1, 0) )
+cal_data$bin <- cut(cal_data$predicted, breaks = seq(0, 1, by = 0.25))
+cal_summary_test <- cal_data %>%
+  group_by(bin) %>%
+  summarise(
+    mean_predicted = mean(predicted),
+    mean_observed = mean(observed),
+    se_predicted = sd(predicted) / sqrt(n()),
+    se_observed = sd(observed) / sqrt(n())
+  )
+testbrier<-BrierScore(cal_data$predicted, cal_data$observed)
+cal_summary_train$dataset <- "Test"
+cal_summary_test$dataset <- "Training"
+combined_cal_summary <- rbind(cal_summary_train, cal_summary_test)
+ggplot(combined_cal_summary, aes(x = mean_predicted, y = mean_observed, color = dataset)) +
+  geom_point() +
+  geom_line() +
+  geom_errorbar(aes(ymin = mean_observed - se_observed, ymax = mean_observed + se_observed), width = 0.02) +
+  geom_errorbarh(aes(xmin = mean_predicted - se_predicted, xmax = mean_predicted + se_predicted), height = 0.02) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  annotate("text", x = 0.72, y = 0.1, label = paste("Training Brier Score:", round(trainingbrier, 2.5)), color = "#2F8AC4",size=4)+
+  annotate("text", x = 0.68, y = 0.2, label = paste("Test Brier Score:", round(testbrier, 2.5)), color = "#ED645A",size=4)+
+  labs(x = "Predicted", y = "Observed", title = "Calibration Curve") +
+  theme_bw() +
+  theme(
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    legend.title = element_blank(), 
+    legend.position = "top",
+    legend.text = element_text(size = 8),
+    plot.title = element_text(size = 12,  hjust = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )+
+  scale_color_manual(values = c("Training" = "#2F8AC4", "Test" = "#ED645A"))
+
+#Nomogram
+library(rms)
+library(regplot)
+library(caret)
+library(caretEnsemble)
+library(pROC)
+library(ggplot2)
+library(rmda)
+library(DescTools)
+library(dplyr)
+ddist <- datadist(data)
+options(datadist = 'ddist')
+data$Respond<-as.factor(data$Respond)
+data$Respond <- relevel(data$Respond, ref = "RD")
+fit3 <- glm(Respond ~ Riskscore+  T , data = data,family="binomial")
+regplot(fit3, plots = c("density","boxes"), center = T,
+        observation = T,points = T,
+        dencol = "#52BCA3",boxcol = "#2F8AC4",
+        droplines=T,title = "")
+new_data<-na.omit(data)
+predictednew<- predict(fit3, newdata = new_data, type = "response")
+cal_data <- data.frame(predicted = predictednew,observed = ifelse(new_data$Respond == "RD", 0, 1))
+set.seed(2023)
+cal_data$bin <- cut(cal_data$predicted, breaks = seq(0, 1, by = 0.2))
+cal_summary <- cal_data %>%
+  group_by(bin) %>%
+  summarise(
+    mean_predicted = mean(predicted),
+    mean_observed = mean(observed),
+    se_predicted = sd(predicted) / sqrt(n()),
+    se_observed = sd(observed) / sqrt(n())
+  )
+brier<-BrierScore(cal_data$predicted, cal_data$observed)
+ggplot(cal_summary, aes(x = mean_predicted, y = mean_observed)) +
+  geom_point() +
+  geom_line(color = "#2F8AC4") +
+  geom_errorbar(aes(ymin = mean_observed - se_observed, ymax = mean_observed + se_observed), width = 0.02,color="#FF0000") +
+  geom_errorbarh(aes(xmin = mean_predicted - se_predicted, xmax = mean_predicted + se_predicted), height = 0.02,color="#FF0000") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed",color="#A5AA99") +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  annotate("text", x = 0.75, y = 0.1, label = paste("Brier-Score:", round(brier, 3)), color = "black",size=5)+
+  labs(x = "Predicted", y = "Observed")+
+  theme_bw()+
+  theme( axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    plot.title = element_text(size = 14,  hjust = 0.5),
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank())
+
+#Survery
+sameSample=intersect(row.names(cluster), row.names(cli))
+rt=cbind(cli[sameSample,], Cluster=cluster[sameSample,])
+length=length(levels(factor(rt$Cluster)))
+diff=survdiff(Surv(futime, fustat) ~ Cluster, data = rt)
+pValue=1-pchisq(diff$chisq, df=length-1)
+if(pValue<0.001){
+  pValue="p<0.001"
+}else{
+  pValue=paste0("p=",sprintf("%.03f",pValue))
+}
+fit <- survfit(Surv(futime, fustat) ~ Cluster, data = rt)
+bioCol=c("#0066FF","#FF0000","#FF9900","#6E568C","#7CC767","#223D6C","#D20A13","#FFD121","#088247","#11AA4D")
+bioCol=bioCol[1:length]
+surPlot = ggsurvplot(fit, 
+                     data = rt,
+                     conf.int = F,
+                     pval = pValue,
+                     pval.size = 5,
+                     legend.title = "Risk",
+                     legend.labs = levels(factor(rt[,"Cluster"])),
+                     legend = "top",
+                     font.legend = 10,
+                     xlab = "Time(years)",
+                     break.time.by = 1,
+                     palette = bioCol,
+                     surv.median.line = "hv",
+                     risk.table = T,
+                     cumevents = F,
+                     risk.table.height = .25)
+surPlot$plot = surPlot$plot + guides(colour = guide_legend(title = NULL))
+
+##########TME##########################
+#CIBERSORT, EPIC, MCPCOUNTER, QUANTISEQ, TIMER, XCELL
+library(immunedeconv)
+library(magrittr )
+library(psych)
+method=c('quantiseq','xcell','estimate','epic','mcp_counter','timer','cibersort','cibersort_abs')
+res1=deconvolute(result,'quantiseq')
+res2=deconvolute(result,'xcell')
+res3=deconvolute_estimate(result)
+res4=deconvolute(result,'epic')
+res5=deconvolute(result,'mcp_counter')
+indications=c(rep("BRCA",ncol(result)))
+res6=deconvolute(result,'timer',indications = indications)
+res7<-CIBERSORT-Results
+res7=as.data.frame(t(res7))%>%
+  tibble::add_column(cell_type = rownames(.),.before="GSM615098")%>%
+  tibble::remove_rownames(.)
+res1$cell_type=paste(res1$cell_type,'QUANTISEQ',sep = '_')
+res2$cell_type=paste(res2$cell_type,'XCELL',sep = '_')
+res4$cell_type=paste(res4$cell_type,'EPIC',sep = '_')
+res5$cell_type=paste(res5$cell_type,'MCPCOUNTER',sep = '_')
+res6$cell_type=paste(res6$cell_type,'TIMER',sep = '_')
+res7$cell_type=paste(res7$cell_type,'CIBERSORT',sep = '_')
+cell_ratio=dplyr::bind_rows(res1,res2,res4,res5,res6,res7)%>%
+  tibble::column_to_rownames("cell_type")
+risk=read.table("riskscore.txt", header = TRUE, sep = "\t", row.names = 1)
+immucell<-as.data.frame(t(cell_ratio))
+cor <-psych::corr.test(risk$Risk, immucell, method = 'pearson',adjust="none")
+cmt <-t(as.data.frame(cor$r))%>%
+  as.data.frame()%>%
+  tibble::add_column(rownames(.))%>%
+  tibble::remove_rownames(.)
+colnames(cmt)=c("Correlation Coefficient","Immune cell")
+cmp <-t(as.data.frame(cor$p.adj))%>%
+  as.data.frame()%>%
+  tibble::add_column(rownames(.))%>%
+  tibble::remove_rownames(.)
+colnames(cmp)=c("adjp","Immune cell")
+cmt$adjp <- cmp$adjp
+subset_cmt <- subset(cmt, adjp < 0.05)
+subset_cmt$`Immune cell`=factor(subset_cmt$`Immune cell`,levels = unique(subset_cmt$`Immune cell`))
+subset_cmt$Software=rep(c('QUANTISEQ','XCELL','EPIC','MCPCOUNTER','TIMER','CIBERSORT'),
+                        times =c(6, 19, 4, 8, 3, 5))
+save(subset_cmt,file="subset_cmt.Rdata")
+load("subset_cmt.Rdata")
+library(ggplot2)
+y_cols <- rep(c("#f27767","#bc9826","#53b449","#23b892","#1cb6ec","#d269a4"),times =c(6, 19, 4, 8, 3, 5))
+ggplot()+geom_point(data=subset_cmt,aes(`Correlation Coefficient`,`Immune cell`,color=Software),
+             shape=16,size=4)+
+  scale_color_manual(values = c('QUANTISEQ' = "#f27767",'XCELL' = "#bc9826",
+                                'EPIC'="#53b449",'MCPCOUNTER'="#23b892",
+                                'TIMER'="#1cb6ec",'CIBERSORT'="#d269a4"))+
+  theme(axis.text.y=element_text(size=8,colour =y_cols ),
+        axis.text.x=element_text(size=10),
+        axis.title.x = element_text(size=12),
+        axis.title.y = element_text(size=12))
+
+##########Drug Sensitivity##########################
+calcPhenotype(trainingExprData = GDSC2_Expr,
+              trainingPtype = GDSC2_Res,
+              testExprData = testExpr,
+              batchCorrect = 'eb',  
+              powerTransformPhenotype = TRUE,
+              removeLowVaryingGenes = 0.2,
+              minNumSamples = 10, 
+              printOutput = TRUE, 
+              removeLowVaringGenesFrom = 'rawData' )
