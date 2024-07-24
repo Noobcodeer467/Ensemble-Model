@@ -11,16 +11,16 @@ library(BiocParallel)
 library(tidyverse)  
 library(ggthemes)
 library(ggprism)
-KEGG_df_all <-  msigdbr(species = "Homo sapiens", # Homo sapiens or Mus musculus
+KEGG_df_all <-  msigdbr(species = "Homo sapiens", 
                         category = "C2",
                         subcategory = "CP:KEGG") 
 KEGG_df <- dplyr::select(KEGG_df_all,gs_name,gs_exact_source,gene_symbol)
-kegg_list <- split(KEGG_df$gene_symbol, KEGG_df$gs_name) ##按照gs_name给gene_symbol分组
+kegg_list <- split(KEGG_df$gene_symbol, KEGG_df$gs_name) 
 gsva_mat <- gsva(expr=dat, 
                  gset.idx.list=geneset, 
-                 kcdf="Poisson" ,#"Gaussian" for logCPM,logRPKM,logTPM, "Poisson" for counts
+                 kcdf="Poisson" ,
                  verbose=T, 
-                 parallel.sz = parallel::detectCores())#调用所有核
+                 parallel.sz = parallel::detectCores())
 
 group_list<-factor(c(rep("pCR",57), rep("RD",113)), levels = c('pCR', 'RD'))
 design <- model.matrix(~0+factor(group_list))
@@ -369,12 +369,12 @@ ggplot(dca_melt, aes(x = net.benefit.threshold, y = `Net Benefit`, color = Group
         axis.title.x = element_text(size = 12),
         axis.title.y = element_text(size = 12),
         axis.text.x = element_text(size = 10),
-        axis.text.y = element_text(size = 10),  # Position the legend inside the plot
+        axis.text.y = element_text(size = 10),  
         legend.title = element_blank(),
-        legend.text = element_text(size = 10),   # Remove the legend title
-        panel.grid.major = element_blank(),  # Remove major grid
+        legend.text = element_text(size = 10),   
+        panel.grid.major = element_blank(), 
         panel.grid.minor = element_blank(),
-        plot.title = element_text(size = 14,  hjust = 0.5)) +  # Remove minor grid
+        plot.title = element_text(size = 14,  hjust = 0.5)) + 
   ylim(-0.1, 0.35)+  # Here is where we set the y axis limits
   scale_color_discrete(labels = c("None", "All", "Pred"))
 
